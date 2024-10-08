@@ -1,10 +1,13 @@
+use std::io::{Cursor};
 use std::sync::Arc;
+use arboard::{Clipboard, ImageData};
+use image::{DynamicImage, ImageBuffer, ImageOutputFormat, RgbaImage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tauri::State;
 
 use tokio::net::TcpListener;
-use tokio::time::{timeout, Duration};
+use tokio::time::{self, timeout, Duration};
 
 #[derive(Default)]
 pub struct ServerState {
@@ -57,7 +60,6 @@ pub async fn start_server(state: State<'_, ServerState>, password: String) -> Re
     let mut is_running = state.is_running.lock().await;
     println!("Attempting to start server. Current status: {}", *is_running);
     
-
     if !*is_running {
         *is_running = true;
         let password = Arc::new(password);
@@ -68,16 +70,22 @@ pub async fn start_server(state: State<'_, ServerState>, password: String) -> Re
             authenticated_clients: Arc::clone(&state.authenticated_clients),
         });
 
+        let server_state = Arc::clone(&state_clone);
         tokio::spawn(async move {
-            if let Err(e) = run_server(password, state_clone).await {
+            if let Err(e) = run_server(password, server_state).await {
                 eprintln!("Error running the server: {}", e);
             }
         });
+
+        let monitor_state = Arc::clone(&state_clone);
+        tokio::spawn(async move {
+            monitor_clipboard(monitor_state).await;
+        });
         
-        println!("Server started successfully"); // Debug log
+        println!("Server and clipboard monitor started successfully");
         Ok(())
     } else {
-        println!("Server start failed - already running"); // Debug log
+        println!("Server start failed - already running");
         Err("Server start failed - already running".into())
     }
 }
@@ -179,6 +187,77 @@ async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str
     }
 
     Ok(())
+}
+
+async fn monitor_clipboard(state: Arc<ServerState>) {
+    let mut last_content: Option<ClipboardContent> = None;
+    let mut clipboard = Clipboard::new().expect("Falha ao criar a instância do clipboard");
+
+    while *state.is_running.lock().await {
+        time::sleep(time::Duration::from_secs(1)).await;
+
+        let content = get_clipboard_content(&mut clipboard);
+
+        // Compare usando clone() na struct ClipboardContent
+        if last_content.as_ref().map(|c| c.data.clone()) != Some(content.data.clone()) {
+            last_content = Some(content.clone()); // Use the clone method here
+
+            let json_content = serde_json::json!({
+                "type": content.content_type,
+                "data": content.data,
+            });
+
+            if let Err(e) = state.broadcast(&json_content.to_string()).await {
+                eprintln!("Erro ao transmitir a mensagem: {}", e);
+            }
+        }
+    }
+    println!("Monitoramento do clipboard parado");
+}
+
+
+#[derive(Clone)]
+struct ClipboardContent {
+    content_type: String,
+    data: String,
+}
+
+fn get_clipboard_content(clipboard: &mut Clipboard) -> ClipboardContent {
+    if let Ok(text) = clipboard.get_text() {
+        return ClipboardContent {
+            content_type: "text".to_string(),
+            data: text,
+        };
+    }
+    
+    if let Ok(image) = clipboard.get_image() {
+        return ClipboardContent {
+            content_type: "image".to_string(),
+            data: img_to_buffer(image)
+        };
+    }
+
+    ClipboardContent {
+        content_type: "empty".to_string(),
+        data: String::new(),
+    }
+}
+
+fn img_to_buffer(image: ImageData) -> String  { 
+    let image: RgbaImage = ImageBuffer::from_raw(
+        image.width.try_into().unwrap(),
+        image.height.try_into().unwrap(),
+        image.bytes.into_owned(),
+    ).unwrap();
+    
+    let img = DynamicImage::ImageRgba8(image);
+    
+    let mut buffer = Vec::new();
+    img.write_to(&mut Cursor::new(&mut buffer), ImageOutputFormat::Png).unwrap();
+    
+    let data = base64::encode(&buffer);
+    
+    return data;
 }
 
 #[tauri::command]
