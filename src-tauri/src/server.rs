@@ -24,13 +24,22 @@ impl ServerState {
     }
 
     pub async fn broadcast(&self, message: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let clients = self.authenticated_clients.lock().await;
+        let mut clients = self.authenticated_clients.lock().await;
+        let mut clients_to_remove = vec![];
+
         for client in clients.iter() {
             let mut client_socket = client.lock().await;
             if let Err(e) = client_socket.write_all(message.as_bytes()).await {
                 eprintln!("Error sending message to client: {}", e);
+                if let Err(close_error) = client_socket.shutdown().await {
+                    eprintln!("Error closing socket: {}", close_error);
+                }
+                clients_to_remove.push(Arc::clone(client));
             }
         }
+
+        clients.retain(|client| !clients_to_remove.iter().any(|c| Arc::ptr_eq(c, client)));
+
         Ok(())
     }
 }
@@ -81,6 +90,12 @@ pub async fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
     if *is_running {
         *is_running = false;
         println!("Server stopped successfully"); // Debug log
+
+        let mut clients = state.clients.lock().await;
+        let mut authenticated_clients = state.authenticated_clients.lock().await;
+
+        clients.clear();
+        authenticated_clients.clear();
         Ok(())
     } else {
         println!("Server stop failed - not running"); // Debug log
@@ -168,8 +183,16 @@ async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str
 
 #[tauri::command]
 pub async fn broadcast_message_command(state: State<'_, ServerState>, message: String) -> Result<(), String> {
-    if let Err(e) = state.broadcast(&message).await {
-        return Err(format!("Failed to broadcast message: {}", e));
+    let is_running = state.is_running.lock().await;
+    
+    if *is_running {
+        if let Err(e) = state.broadcast(&message).await {
+            return Err(format!("Failed to broadcast message: {}", e));
+        }
+    }else {
+        println!("Broadcast failed - server not running"); // Debug log
+        return Err(format!("Failed to broadcast message"));
     }
+  
     Ok(())
 }
