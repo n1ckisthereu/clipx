@@ -10,6 +10,7 @@ use tokio::time::{timeout, Duration};
 pub struct ServerState {
     is_running: Arc<Mutex<bool>>,
     clients: Arc<Mutex<Vec<Arc<Mutex<tokio::net::TcpStream>>>>>,
+    authenticated_clients: Arc<Mutex<Vec<Arc<Mutex<tokio::net::TcpStream>>>>>,
 }
 
 impl ServerState {
@@ -18,11 +19,12 @@ impl ServerState {
         ServerState {
             is_running: Arc::new(Mutex::new(false)),
             clients: Arc::new(Mutex::new(Vec::new())),
+            authenticated_clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub async fn broadcast(&self, message: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let clients = self.clients.lock().await;
+        let clients = self.authenticated_clients.lock().await;
         for client in clients.iter() {
             let mut client_socket = client.lock().await;
             if let Err(e) = client_socket.write_all(message.as_bytes()).await {
@@ -54,6 +56,7 @@ pub async fn start_server(state: State<'_, ServerState>, password: String) -> Re
         let state_clone = Arc::new(ServerState {
             is_running: Arc::clone(&state.is_running),
             clients: Arc::clone(&state.clients),
+            authenticated_clients: Arc::clone(&state.authenticated_clients),
         });
 
         tokio::spawn(async move {
@@ -96,14 +99,14 @@ async fn run_server(password: Arc<String>, state: Arc<ServerState>) -> Result<()
             Ok(Ok((socket, addr))) => {
                 println!("New connection from: {}", addr);
                 let password = Arc::clone(&password);
-                let clients = Arc::clone(&state.clients);
-                let client_socket = Arc::new(Mutex::new(socket)); // Wrapping socket in Arc<Mutex>
-
-                // Add the new client to the list
-                clients.lock().await.push(Arc::clone(&client_socket));
-
+                let state_clone = Arc::clone(&state);
+    
+                let client_socket = Arc::new(Mutex::new(socket));
+    
+                state_clone.clients.lock().await.push(Arc::clone(&client_socket));
+    
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(client_socket, &password, &clients).await {
+                    if let Err(e) = handle_client(client_socket, &password, &state_clone).await {
                         eprintln!("Error handling client: {}", e);
                     }
                 });
@@ -125,7 +128,7 @@ async fn run_server(password: Arc<String>, state: Arc<ServerState>) -> Result<()
     Ok(())
 }
 
-async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str, clients: &Arc<Mutex<Vec<Arc<Mutex<tokio::net::TcpStream>>>>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str, state: &Arc<ServerState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = [0; 1024];
     let mut socket_guard = socket.lock().await;
     match timeout(Duration::from_secs(5), socket_guard.read(&mut buffer)).await {
@@ -135,6 +138,8 @@ async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str
 
             let response = if client_password.trim() == password {
                 println!("Correct password from client");
+                let mut authenticated_clients = state.authenticated_clients.lock().await;
+                authenticated_clients.push(Arc::clone(&socket));
                 "Correct password! Connected.\n"
             } else {
                 println!("Incorrect password from client");
@@ -145,8 +150,10 @@ async fn handle_client(socket: Arc<Mutex<tokio::net::TcpStream>>, password: &str
         }
         Ok(Ok(_)) => {
             println!("Client disconnected");
-            let mut clients_lock = clients.lock().await;
+            let mut clients_lock = state.clients.lock().await;
             clients_lock.retain(|client| !Arc::ptr_eq(client, &socket));
+            let mut authenticated_clients_lock = state.authenticated_clients.lock().await;
+            authenticated_clients_lock.retain(|client| !Arc::ptr_eq(client, &socket));
         }
         Ok(Err(e)) => {
             return Err(e.into());
